@@ -17,18 +17,29 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 
 app = FastAPI()
 
+# Regex to grab the first URL from HTML body if needed
 URL_RE = re.compile(r"(https?://[^\s\"<>]+)")
+# Used to detect long runs of common mojibake markers
 MOJIBAKE_RUN = re.compile(r"[ÃÂâÙØ]{2,}[\x00-\xFF]{2,}")
+
+# Bump this string anytime you redeploy so you can verify Render updated
+APP_VERSION = "2026-03-02-1"
 
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "message": "API is running. Use /webinars or /debug/events"}
+    return {"ok": True, "message": "API is running. Use /webinars or /debug/events", "version": APP_VERSION}
+
+
+@app.get("/version")
+def version() -> Dict[str, Any]:
+    # Simple endpoint so you can confirm Render is running the latest code
+    return {"version": APP_VERSION}
 
 
 def get_app_token() -> str:
     if not TENANT_ID or not CLIENT_ID or not CLIENT_SECRET:
-        raise RuntimeError("Missing TENANT_ID/CLIENT_ID/CLIENT_SECRET in .env")
+        raise RuntimeError("Missing TENANT_ID/CLIENT_ID/CLIENT_SECRET in environment variables")
 
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
@@ -46,6 +57,12 @@ def get_app_token() -> str:
 
 
 def parse_graph_datetime(dt_str: str) -> datetime:
+    """
+    Graph often returns: "2026-02-16T14:00:00.0000000"
+    - If it ends with Z, parse as UTC
+    - If it has >6 microseconds digits, trim to 6
+    - If timezone is missing, treat it as UTC
+    """
     if dt_str.endswith("Z"):
         return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
@@ -54,7 +71,6 @@ def parse_graph_datetime(dt_str: str) -> datetime:
         digits = "".join(ch for ch in tail if ch.isdigit())[:6]
         dt_str = f"{head}.{digits}" if digits else head
 
-    # If tz is missing, treat as UTC
     return datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
 
 
@@ -63,6 +79,9 @@ def fetch_all_pages(
     headers: Dict[str, str],
     params: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
+    """
+    Follow @odata.nextLink pagination automatically.
+    """
     items: List[Dict[str, Any]] = []
     next_url: Optional[str] = url
     next_params = params
@@ -70,7 +89,7 @@ def fetch_all_pages(
     while next_url:
         if next_params is not None:
             r = requests.get(next_url, headers=headers, params=next_params, timeout=25)
-            next_params = None
+            next_params = None  # only for first request
         else:
             r = requests.get(next_url, headers=headers, timeout=25)
 
@@ -92,6 +111,10 @@ def extract_first_url(html: str) -> Optional[str]:
 
 
 def split_title(text: str) -> Dict[str, str]:
+    """
+    Your subject looks like:
+    English title | Arabic title
+    """
     parts = [p.strip() for p in (text or "").split("|")]
     if len(parts) >= 2:
         return {"title_en": parts[0], "title_ar": parts[1]}
@@ -99,10 +122,14 @@ def split_title(text: str) -> Dict[str, str]:
 
 
 def fix_mojibake(text: str) -> str:
+    """
+    Attempt to repair Arabic text that appears as mojibake (Ù… Ø… etc)
+    without breaking already-correct Arabic.
+    """
     if not text:
         return text
 
-    # If it already contains real Arabic, keep as-is
+    # If it already contains real Arabic characters, keep it
     if any("\u0600" <= ch <= "\u06FF" for ch in text):
         return text
 
@@ -110,54 +137,53 @@ def fix_mojibake(text: str) -> str:
     if not any(m in text for m in markers):
         return text
 
-    # 1) Try repairing the whole string (best case)
+    # 1) Try fixing the whole string
     for enc in ("latin1", "cp1252"):
         try:
             fixed = text.encode(enc).decode("utf-8")
+            # If Arabic appears, it's likely repaired
             if any("\u0600" <= ch <= "\u06FF" for ch in fixed):
+                return fixed
+            # Even if Arabic doesn't appear, it might fix punctuation like “–”
+            if fixed != text:
                 return fixed
         except Exception:
             pass
 
-    # 2) Repair only the mojibake parts (robust case)
+    # 2) Try repairing only mojibake runs
     def _repair_match(m: re.Match) -> str:
         chunk = m.group(0)
         for enc in ("latin1", "cp1252"):
             try:
-                repaired = chunk.encode(enc).decode("utf-8")
-                if any("\u0600" <= ch <= "\u06FF" for ch in repaired):
-                    return repaired
-                return repaired
+                return chunk.encode(enc).decode("utf-8")
             except Exception:
                 continue
-        # last resort: try ignoring invalid bytes
         try:
             return chunk.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
         except Exception:
             return chunk
 
     fixed2 = MOJIBAKE_RUN.sub(_repair_match, text)
-
-    # Return repaired if it improved (Arabic appeared or markers reduced)
-    if any("\u0600" <= ch <= "\u06FF" for ch in fixed2):
-        return fixed2
-    if ("Ù" not in fixed2 and "Ø" not in fixed2) or fixed2 != text:
-        return fixed2
-
-    return text
+    return fixed2 if fixed2 else text
 
 
 @app.get("/debug/events")
 def debug_events(
     user_principal_name: str = Query(...),
-    days_ahead: int = Query(365, ge=1, le=1460),
+    days_back: int = Query(30, ge=0, le=1460),
+    days_ahead: int = Query(30, ge=1, le=1460),
     limit: int = Query(30, ge=1, le=200),
 ) -> Dict[str, Any]:
+    """
+    Debug endpoint to confirm Graph is returning what you expect
+    for the time window you choose.
+    """
     token = get_app_token()
     headers = {"Authorization": f"Bearer {token}"}
 
-    start = datetime.now(timezone.utc)
-    end = start + timedelta(days=days_ahead)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days_back)
+    end = now + timedelta(days=days_ahead)
 
     base = f"{GRAPH}/users/{user_principal_name}/calendarView"
     params = {
@@ -172,6 +198,7 @@ def debug_events(
     sample = events[:limit]
 
     return {
+        "version": APP_VERSION,
         "rangeUTC": {"start": start.isoformat(), "end": end.isoformat()},
         "fetched": len(events),
         "sample": [
@@ -192,23 +219,26 @@ def webinars(
     user_principal_name: str = Query(..., description="e.g. noora.amer@arabianchild.org"),
     subject_contains: str = Query(..., description="text to match in subject"),
     upcoming_only: bool = Query(False),
-    days_ahead: int = Query(365, ge=1, le=1460),
+    days_back: int = Query(365, ge=0, le=1460, description="How many days in the past to include"),
+    days_ahead: int = Query(365, ge=1, le=1460, description="How many days in the future to include"),
 ) -> Dict[str, Any]:
+    """
+    Returns webinars matching subject_contains within a time window that includes:
+    - Past: now - days_back
+    - Future: now + days_ahead
+    """
     token = get_app_token()
     headers = {"Authorization": f"Bearer {token}"}
 
     now = datetime.now(timezone.utc)
 
-    # how far back to look for past webinars
-    past_days = 365  # you can change this (ex: 180, 730)
-    start_window = now - timedelta(days=past_days)
-    
-    # how far ahead to look for upcoming webinars
+    # ✅ IMPORTANT: include past + future in the Graph query window
+    start_window = now - timedelta(days=days_back)
     end_window = now + timedelta(days=days_ahead)
 
     base = f"{GRAPH}/users/{user_principal_name}/calendarView"
     params = {
-        "startDateTime": now.isoformat(),
+        "startDateTime": start_window.isoformat(),
         "endDateTime": end_window.isoformat(),
         "$select": "id,subject,start,end,iCalUId,webLink,onlineMeeting,isCancelled,body",
         "$orderby": "start/dateTime",
@@ -224,12 +254,10 @@ def webinars(
         raw_subject = (e.get("subject") or "").strip()
         subject = fix_mojibake(raw_subject)
 
-        titles = split_title(subject)
-        title_en = fix_mojibake(titles["title_en"])
-        title_ar = fix_mojibake(titles["title_ar"])
         if not subject:
             continue
 
+        # Case-insensitive subject contains
         if needle and needle not in subject.lower():
             continue
 
@@ -243,6 +271,7 @@ def webinars(
 
         is_cancelled = bool(e.get("isCancelled", False))
 
+        # Determine status
         if is_cancelled:
             status = "cancelled"
         else:
@@ -251,18 +280,22 @@ def webinars(
             elif start_dt > now:
                 status = "upcoming"
             else:
+                # event currently in progress -> treat as upcoming (so user sees Join)
                 status = "upcoming"
 
         if upcoming_only and status != "upcoming":
             continue
 
+        # Prefer Teams join URL
         join_url = (e.get("onlineMeeting") or {}).get("joinUrl")
+
+        # Sometimes the join link is in the body
         body_html = (e.get("body") or {}).get("content") or ""
         body_url = extract_first_url(body_html)
 
-        # Prefer join/registration URL. Fallback to calendar item link.
         register_url = join_url or body_url or e.get("webLink")
 
+        # Split EN|AR title if possible
         titles = split_title(subject)
         title_en = fix_mojibake(titles["title_en"])
         title_ar = fix_mojibake(titles["title_ar"])
@@ -281,9 +314,10 @@ def webinars(
             }
         )
 
+    # Order: upcoming asc, past desc, cancelled desc
     upcoming = sorted((x for x in items if x["status"] == "upcoming"), key=lambda x: x["startUTC"])
     past = sorted((x for x in items if x["status"] == "past"), key=lambda x: x["startUTC"], reverse=True)
     cancelled = sorted((x for x in items if x["status"] == "cancelled"), key=lambda x: x["startUTC"], reverse=True)
 
     ordered = upcoming + past + cancelled
-    return {"count": len(ordered), "items": ordered}
+    return {"version": APP_VERSION, "count": len(ordered), "items": ordered}
