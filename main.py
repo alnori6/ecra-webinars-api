@@ -198,6 +198,12 @@ def webinars(
     headers = {"Authorization": f"Bearer {token}"}
 
     now = datetime.now(timezone.utc)
+
+    # how far back to look for past webinars
+    past_days = 365  # you can change this (ex: 180, 730)
+    start_window = now - timedelta(days=past_days)
+    
+    # how far ahead to look for upcoming webinars
     end_window = now + timedelta(days=days_ahead)
 
     base = f"{GRAPH}/users/{user_principal_name}/calendarView"
