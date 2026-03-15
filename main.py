@@ -7,6 +7,10 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 
+# Reusable HTTP session for connection pooling
+session = requests.Session()
+session.headers.update({"Content-Type": "application/x-www-form-urlencoded"})
+
 load_dotenv()
 
 TENANT_ID = os.getenv("TENANT_ID")
@@ -25,6 +29,10 @@ MOJIBAKE_RUN = re.compile(r"[ÃÂâÙØ]{2,}[\x00-\xFF]{2,}")
 # Bump this string anytime you redeploy so you can verify Render updated
 APP_VERSION = "2026-03-02-1"
 
+# Cached Microsoft Graph token
+TOKEN_CACHE: Optional[str] = None
+TOKEN_EXPIRES: Optional[datetime] = None
+
 
 @app.get("/")
 def root() -> Dict[str, Any]:
@@ -37,11 +45,28 @@ def version() -> Dict[str, Any]:
     return {"version": APP_VERSION}
 
 
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "healthy",
+        "version": APP_VERSION,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def get_app_token() -> str:
+    global TOKEN_CACHE, TOKEN_EXPIRES
+
     if not TENANT_ID or not CLIENT_ID or not CLIENT_SECRET:
         raise RuntimeError("Missing TENANT_ID/CLIENT_ID/CLIENT_SECRET in environment variables")
 
+    now = datetime.now(timezone.utc)
+
+    if TOKEN_CACHE and TOKEN_EXPIRES and now < TOKEN_EXPIRES:
+        return TOKEN_CACHE
+
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+
     data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -49,11 +74,30 @@ def get_app_token() -> str:
         "grant_type": "client_credentials",
     }
 
-    r = requests.post(token_url, data=data, timeout=20)
+    r = session.post(token_url, data=data, timeout=20)
+
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Token error: {r.text}")
 
-    return r.json()["access_token"]
+    body = r.json()
+
+    TOKEN_CACHE = body["access_token"]
+    TOKEN_EXPIRES = now + timedelta(seconds=body["expires_in"] - 60)
+
+    return TOKEN_CACHE
+
+
+def safe_get(url: str, headers: Dict[str, str], params: Optional[Dict[str, str]] = None, retries: int = 3):
+    for attempt in range(retries):
+        r = session.get(url, headers=headers, params=params, timeout=25)
+
+        if r.status_code == 200:
+            return r
+
+        if attempt < retries - 1:
+            continue
+
+        raise HTTPException(status_code=502, detail=f"Graph error: {r.text}")
 
 
 def parse_graph_datetime(dt_str: str) -> datetime:
@@ -71,7 +115,7 @@ def parse_graph_datetime(dt_str: str) -> datetime:
         digits = "".join(ch for ch in tail if ch.isdigit())[:6]
         dt_str = f"{head}.{digits}" if digits else head
 
-    return datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
 
 
 def fetch_all_pages(
@@ -88,13 +132,10 @@ def fetch_all_pages(
 
     while next_url:
         if next_params is not None:
-            r = requests.get(next_url, headers=headers, params=next_params, timeout=25)
+            r = safe_get(next_url, headers, next_params)
             next_params = None  # only for first request
         else:
-            r = requests.get(next_url, headers=headers, timeout=25)
-
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Graph error: {r.text}")
+            r = safe_get(next_url, headers)
 
         body = r.json()
         items.extend(body.get("value", []))
